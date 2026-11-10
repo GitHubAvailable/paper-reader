@@ -171,6 +171,8 @@ function ImageLightbox({
 const FONT_SIZES = [12, 13, 14, 15, 16, 17, 18, 20];
 const DEFAULT_FONT_IDX = 3; // 15px
 const COLLAPSE_CHARS = 300;
+// A scroll of ours has come to rest when no scroll has followed it for this long
+const SETTLE_MS = 160;
 
 // The images attached to a draft, kept for the session: too large for the
 // drafts store, but they should still be there after a crossing to the
@@ -452,6 +454,14 @@ export const ExplainPanel = memo(function ExplainPanel({ annotations, activeId, 
     setFollow(next);
     trace("follow", { mode: next.mode, conversation: next.id?.slice(0, 8) ?? null, index: next.index, via });
   }, [positionKey]);
+  // A jump says where it is going: the focus is there at once, and stays
+  // there once the scroll comes to rest
+  const aimFocus = useCallback((pair: { id: string; index: number } | null) => {
+    if (!pair) return;
+    aimedPair.current = pair;
+    pinned.current = null;
+    setFollowing({ id: pair.id, index: pair.index, mode: "free" }, "aimed");
+  }, [setFollowing]);
   // Going where a mode looks (see goTo below), reachable from the restore
   const goToRef = useRef<((mode: FollowMode, id: string, index: number | null) => void) | null>(null);
   // A conversation's card, found in the list rather than read off the refs
@@ -461,6 +471,21 @@ export const ExplainPanel = memo(function ExplainPanel({ annotations, activeId, 
     return list ? list.querySelector(`[data-annotation-id="${id.replace(/["\\]/g, "\\$&")}"]`) : null;
   }, []);
   const pairRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  // The pair a scroll of ours is headed for — a jump, a landing, a passage
+  // clicked. Whoever moves the list, the focus goes to the pair it brings into
+  // view: this one when there is one, else the pair in the middle once the
+  // scroll comes to rest (see the scroll handler below).
+  const aimedPair = useRef<{ id: string; index: number } | null>(null);
+  // The pair holding an element of the list
+  const pairHolding = useCallback((el: Element | null | undefined): { id: string; index: number } | null => {
+    if (!el) return null;
+    for (const [key, box] of Object.entries(pairRefs.current)) {
+      if (!box || !box.contains(el)) continue;
+      const at = key.lastIndexOf(":");
+      return { id: key.slice(0, at), index: Number(key.slice(at + 1)) };
+    }
+    return null;
+  }, []);
   // The pair under the middle of the window, or the nearest to it: what the
   // reader is on when nothing has been followed yet, shown focused (picked on
   // scroll, below, with the conversation the bar is bound to). Once something
@@ -743,6 +768,7 @@ export const ExplainPanel = memo(function ExplainPanel({ annotations, activeId, 
       trace("scrollIntoView", { reason: "jump to a linked passage", target: describeForTrace(el), block: "center" });
       smoothUntil.current = Date.now() + 700;
       el.scrollIntoView({ behavior: "smooth", block: "center" });
+      aimFocus(pairHolding(el));
       flash(el);
     });
   };
@@ -767,6 +793,7 @@ export const ExplainPanel = memo(function ExplainPanel({ annotations, activeId, 
       trace("scrollIntoView", { reason: "jump to a quoted passage", target: describeForTrace(target), block: "center" });
       smoothUntil.current = Date.now() + 700;
       target.scrollIntoView({ behavior: "smooth", block: "center" });
+      aimFocus(pairHolding(target));
       if (ranges.length && canPaintRanges()) flashRanges(ranges);
       else flash(target);
     });
@@ -1103,7 +1130,9 @@ export const ExplainPanel = memo(function ExplainPanel({ annotations, activeId, 
         const f = followRef.current;
         if (f.id !== id || revealed) {
           pinned.current = null;
-          setFollowing({ id, index: namedPair?.start ?? pairsOf(active)[0]?.start ?? 0, mode: "free" }, revealed ? "revealed" : "switched");
+          const index = namedPair?.start ?? pairsOf(active)[0]?.start ?? 0;
+          aimedPair.current = { id, index };
+          setFollowing({ id, index, mode: "free" }, revealed ? "revealed" : "switched");
         }
       };
       // The panel was folded and has just opened for this: straight there,
@@ -1453,16 +1482,40 @@ export const ExplainPanel = memo(function ExplainPanel({ annotations, activeId, 
         }
       }
       setViewPair((prev) => (prev?.id === nearest?.id && prev?.index === nearest?.index ? prev : nearest ? { id: nearest.id, index: nearest.index } : null));
-      // Scrolling of the reader's own, while nothing is followed, moves the
-      // focus to the pair they scrolled to. A scroll of ours (a landing, a
-      // re-anchor, a mode's glide) leaves it where it was.
+      // The focus follows the pair on screen, whoever moved the list. While a
+      // mode follows an answer, its own scrolling keeps that pair; scrolling
+      // by hand has already let the mode go (see release, above).
       const f = followRef.current;
+      if (!nearest || f.mode !== "free") return;
       const byHand = scrollbarDown.current || Date.now() - lastInputAt.current < 600;
-      // Before anything has been focused at all (a fresh page), the first
-      // scroll by hand is what picks the first focus
-      if (nearest && f.mode === "free" && byHand && (f.id !== nearest.id || f.index !== nearest.index)) {
-        setFollowing({ id: nearest.id, index: nearest.index, mode: "free" }, "scrolled");
+      // By hand: at once, the pair in the middle
+      if (byHand) {
+        aimedPair.current = null;
+        if (settleTimer) { clearTimeout(settleTimer); settleTimer = 0; }
+        if (f.id !== nearest.id || f.index !== nearest.index) setFollowing({ id: nearest.id, index: nearest.index, mode: "free" }, "scrolled");
+        return;
       }
+      // A scroll of ours — a jump, a landing, a restore, a glide: once it has
+      // come to rest, the pair it was headed for if that is on screen, else the
+      // pair in the middle. Not on every frame of the way, or the box would
+      // run through every pair it passes.
+      if (settleTimer) clearTimeout(settleTimer);
+      settleTimer = window.setTimeout(settle, SETTLE_MS);
+    };
+    let settleTimer = 0;
+    const settle = () => {
+      settleTimer = 0;
+      const f = followRef.current;
+      if (f.mode !== "free") return;
+      const view = el.getBoundingClientRect();
+      const onScreen = (pair: { id: string; index: number }) => {
+        const r = pairRefs.current[`${pair.id}:${pair.index}`]?.getBoundingClientRect();
+        return !!r && r.height > 0 && r.bottom > view.top + 8 && r.top < view.bottom - 8;
+      };
+      const aimed = aimedPair.current;
+      aimedPair.current = null;
+      const target = aimed && onScreen(aimed) ? aimed : viewPairRef.current;
+      if (target && (f.id !== target.id || f.index !== target.index)) setFollowing({ id: target.id, index: target.index, mode: "free" }, aimed ? "landed" : "settled");
     };
     // Deferred, never synchronous — setState during an effect cascades a render
     const schedule = () => { if (!frame) frame = requestAnimationFrame(pick); };
@@ -1471,6 +1524,7 @@ export const ExplainPanel = memo(function ExplainPanel({ annotations, activeId, 
     return () => {
       el.removeEventListener("scroll", schedule);
       if (frame) cancelAnimationFrame(frame);
+      if (settleTimer) clearTimeout(settleTimer);
     };
     // The list is a new element each time the panel opens: without isOpen
     // here, a panel folded and opened again kept listening to the old one, and
@@ -1556,7 +1610,12 @@ export const ExplainPanel = memo(function ExplainPanel({ annotations, activeId, 
             <>
               <span className="text-[10px] shrink-0" style={{ color: "var(--ink-faint)" }}>on</span>
               <button
-                onClick={() => { trace("scrollIntoView", { reason: "composer label clicked", conversation: target.id.slice(0, 8), block: "start" }); smoothUntil.current = Date.now() + 700; annotationRefs.current[target.id]?.scrollIntoView({ behavior: "smooth", block: "start" }); }}
+                onClick={() => {
+                  trace("scrollIntoView", { reason: "composer label clicked", conversation: target.id.slice(0, 8), block: "start" });
+                  smoothUntil.current = Date.now() + 700;
+                  if (follow.id === target.id && follow.index !== null) aimedPair.current = { id: target.id, index: follow.index };
+                  annotationRefs.current[target.id]?.scrollIntoView({ behavior: "smooth", block: "start" });
+                }}
                 className="text-[11px] min-w-0 truncate transition-opacity hover:opacity-70"
                 style={{ color: "var(--accent)" }}
                 title="Scroll to this conversation"
